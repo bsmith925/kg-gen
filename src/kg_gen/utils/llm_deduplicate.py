@@ -42,8 +42,8 @@ class LLMDeduplicate:
         self.graph = graph
         self.nodes = list(graph.entities)
         self.edges = list(graph.edges)
-        self.node_clusters = graph.entity_clusters or []
-        self.edge_clusters = graph.edge_clusters or []
+        self.node_clusters = [list(cluster) for cluster in graph.entity_clusters.values()] if graph.entity_clusters else []
+        self.edge_clusters = [list(cluster) for cluster in graph.edge_clusters.values()] if graph.edge_clusters else []
         self.retrieval_model = retrieval_model
         self.lm = lm
         self.max_iterations_per_cluster = max_iterations_per_cluster
