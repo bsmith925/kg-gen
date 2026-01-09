@@ -276,12 +276,32 @@ class KGGen:
         graph: Graph,
         method: DeduplicateMethod = DeduplicateMethod.FULL,
         semhash_similarity_threshold: float = 0.95,  # recommended to keep at 0.95
+        timeout_per_cluster: float = 300.0,  # 5 minutes per cluster
+        max_iterations_per_cluster: int = 10000,  # max iterations in dedup loop
         model: str = None,
         temperature: float = None,
         api_key: str = None,
         api_base: str = None,
         context: str = "",  # TODO: implement context
     ) -> Graph:
+        """
+        Deduplicate entities and edges in a graph.
+
+        Args:
+            graph: Graph to deduplicate
+            method: Deduplication method (SEMHASH, LM_BASED, or FULL)
+            semhash_similarity_threshold: Threshold for semhash matching (0.0-1.0)
+            timeout_per_cluster: Maximum seconds to wait for each cluster (default: 300)
+            max_iterations_per_cluster: Maximum iterations per cluster (default: 10000)
+            model: Optional model override
+            temperature: Optional temperature override
+            api_key: Optional API key override
+            api_base: Optional API base override
+            context: Optional context for clustering (TODO: not yet implemented)
+
+        Returns:
+            Deduplicated graph with entity_clusters and edge_clusters populated
+        """
         # Reinitialize dspy with new parameters if any are provided
         if any([model, temperature, api_key, api_base]):
             self.init_model(
@@ -297,6 +317,8 @@ class KGGen:
             method=method,
             retrieval_model=self.retrieval_model,
             semhash_similarity_threshold=semhash_similarity_threshold,
+            timeout_per_cluster=timeout_per_cluster,
+            max_iterations_per_cluster=max_iterations_per_cluster,
         )
 
     def aggregate(self, graphs: list[Graph]) -> Graph:

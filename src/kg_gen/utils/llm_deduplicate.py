@@ -19,12 +19,25 @@ class LLMDeduplicate:
     edge_clusters: list[list[str]]
     retrieval_model: SentenceTransformer
     lm: dspy.LM
+    max_iterations_per_cluster: int
 
     logger: logging.Logger = logging.getLogger(__name__)
 
-    def __init__(self, retrieval_model: SentenceTransformer, lm: dspy.LM, graph: Graph):
+    def __init__(
+        self,
+        retrieval_model: SentenceTransformer,
+        lm: dspy.LM,
+        graph: Graph,
+        max_iterations_per_cluster: int = 10000,
+    ):
         """
         Initialize KG-assisted RAG with cached embeddings, BM25 tokens, and text chunk store.
+
+        Args:
+            retrieval_model: Sentence transformer for embeddings
+            lm: DSPy language model
+            graph: Graph to deduplicate
+            max_iterations_per_cluster: Maximum iterations per cluster (default: 10000)
         """
         self.graph = graph
         self.nodes = list(graph.entities)
@@ -33,6 +46,7 @@ class LLMDeduplicate:
         self.edge_clusters = graph.edge_clusters or []
         self.retrieval_model = retrieval_model
         self.lm = lm
+        self.max_iterations_per_cluster = max_iterations_per_cluster
 
         # Embeddings and BM25 tokens for nodes
         self.node_embeddings = retrieval_model.encode(
@@ -168,7 +182,7 @@ class LLMDeduplicate:
                 self.edge_clusters = clusters_data
 
     def deduplicate_cluster(
-        self, cluster: list[str], type: str = "node"
+        self, cluster: list[str], type: str = "node", max_iterations: int = 10000
     ) -> tuple[set, dict[str, list[str]]]:
         cluster = cluster.copy()
 
@@ -182,7 +196,7 @@ class LLMDeduplicate:
         )
 
         processed_count = 0
-        while len(cluster) > 0:
+        while len(cluster) > 0 and processed_count < max_iterations:
             processed_count += 1
             item = cluster.pop()
 
@@ -249,16 +263,44 @@ class LLMDeduplicate:
                 )
                 item_clusters[item] = {item}
 
+        # Warn if max iterations was reached before cluster was fully processed
+        if len(cluster) > 0:
+            self.logger.warning(
+                "Max iterations (%s) reached with %s %s remaining in cluster. "
+                "Deduplication may be incomplete.",
+                max_iterations,
+                len(cluster),
+                plural_type,
+            )
+            # Add remaining items as-is
+            for remaining_item in cluster:
+                items.add(remaining_item)
+                item_clusters[remaining_item] = {remaining_item}
+
         self.logger.debug(
-            "Deduplication complete: %s unique %s from original %s",
+            "Deduplication complete: %s unique %s from original %s (processed %s iterations)",
             len(items),
             plural_type,
+            processed_count,
             processed_count,
         )
 
         return items, item_clusters
 
-    def deduplicate(self) -> Graph:
+    def deduplicate(self, timeout_per_cluster: float = 300.0) -> Graph:
+        """
+        Deduplicate entities and edges in the graph.
+
+        Args:
+            timeout_per_cluster: Maximum time in seconds to wait for each cluster to be processed.
+                                Default is 300 seconds (5 minutes) per cluster.
+
+        Returns:
+            Deduplicated graph
+
+        Raises:
+            TimeoutError: If a cluster takes longer than timeout_per_cluster to process
+        """
         # Check if intermediate progress exists and load it
         entities = set()
         edges = set()
@@ -272,30 +314,62 @@ class LLMDeduplicate:
         cnt_nodes = 0
         for i, cluster in enumerate(self.node_clusters):
             cnt_nodes += len(cluster)
-            node_futures.append(pool.submit(self.deduplicate_cluster, cluster, "node"))
+            node_futures.append(
+                pool.submit(
+                    self.deduplicate_cluster,
+                    cluster,
+                    "node",
+                    self.max_iterations_per_cluster,
+                )
+            )
 
         # Process edge clusters in parallel
         edge_futures = []
         cnt_edges = 0
         for i, cluster in enumerate(self.edge_clusters):
             cnt_edges += len(cluster)
-            edge_futures.append(pool.submit(self.deduplicate_cluster, cluster, "edge"))
+            edge_futures.append(
+                pool.submit(
+                    self.deduplicate_cluster,
+                    cluster,
+                    "edge",
+                    self.max_iterations_per_cluster,
+                )
+            )
 
-        # Collect results from node futures
+        # Collect results from node futures with timeout
         for i, future in enumerate(node_futures):
             try:
-                cluster_entities, cluster_entity_map = future.result()
+                cluster_entities, cluster_entity_map = future.result(
+                    timeout=timeout_per_cluster
+                )
                 entities.update(cluster_entities)
                 entity_clusters.update(cluster_entity_map)
+            except TimeoutError:
+                self.logger.error(
+                    "Node cluster %s timed out after %s seconds. Skipping this cluster.",
+                    i,
+                    timeout_per_cluster,
+                )
+                future.cancel()
             except Exception as e:
                 self.logger.error("Error processing node cluster %s: %s", i, e)
 
-        # Collect results from edge futures
+        # Collect results from edge futures with timeout
         for i, future in enumerate(edge_futures):
             try:
-                cluster_edges, cluster_edge_map = future.result()
+                cluster_edges, cluster_edge_map = future.result(
+                    timeout=timeout_per_cluster
+                )
                 edges.update(cluster_edges)
                 edge_clusters.update(cluster_edge_map)
+            except TimeoutError:
+                self.logger.error(
+                    "Edge cluster %s timed out after %s seconds. Skipping this cluster.",
+                    i,
+                    timeout_per_cluster,
+                )
+                future.cancel()
             except Exception as e:
                 self.logger.error("Error processing edge cluster %s: %s", i, e)
 
